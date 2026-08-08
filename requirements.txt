@@ -4,6 +4,7 @@ requests==2.32.4
 aiohttp==3.12.15
 httpx==0.28.1
 aiosqlite==0.21.0
+PySceneDetect==0.6.7
 Pillow==11.3.0
 APScheduler==3.11.0
 psutil==7.0.0
