@@ -1,5 +1,0 @@
-[phases.setup]
-nixPkgs = ["ffmpeg"]
-
-[start]
-cmd = "python paidbotfix2x.py"
