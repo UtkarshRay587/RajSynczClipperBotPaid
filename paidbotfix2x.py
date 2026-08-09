@@ -558,7 +558,8 @@ async def cut_clip(source: Path, out_path: Path, start: float, end: float) -> No
     ]
     rc, err = await run_ffmpeg(args)
     if rc != 0:
-        raise RuntimeError(f"ffmpeg cut failed: {err.strip()[:300]}")
+        detail = err.strip() or f"ffmpeg exited with code {rc} (no stderr output)"
+        raise RuntimeError(f"ffmpeg cut failed: {detail[:400]}")
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +638,7 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
         job.status = "cutting"
         total = len(scenes)
         cut_paths: list[Path] = []
+        last_cut_error: Optional[str] = None
         for idx, (start, end) in enumerate(scenes, 1):
             if job.cancel_event.is_set():
                 raise asyncio.CancelledError()
@@ -651,10 +653,20 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 await cut_clip(source_path, out, start, end)
                 cut_paths.append(out)
             except Exception as e:
+                last_cut_error = str(e)
                 log.warning("clip %d failed: %s", idx, e)
 
         if not cut_paths:
-            raise RuntimeError("All clips failed to encode. Check FFmpeg installation.")
+            # Surface the actual ffmpeg error instead of a generic message so
+            # the user knows *why* (unreadable/corrupt source, unsupported codec,
+            # a split-archive part like .part003.mkv, missing ffmpeg, etc.).
+            if last_cut_error:
+                raise RuntimeError(f"All clips failed to encode. {last_cut_error}")
+            raise RuntimeError(
+                "All clips failed to encode. The source video may be corrupt, "
+                "an unsupported format, or only part of a split file. "
+                "Check that FFmpeg is installed."
+            )
 
         # ---------- 4. Upload ----------
         job.status = "uploading"
@@ -700,7 +712,7 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
         log.exception("job %s failed", job.job_id)
         await edit_status(
             context, job,
-            f"❌ <b>Job failed:</b> <code>{str(e)[:300]}</code>",
+            f"❌ <b>Job failed:</b> <code>{str(e)[:600]}</code>",
         )
     finally:
         # Refund the reserved credit if the job didn't actually complete.
