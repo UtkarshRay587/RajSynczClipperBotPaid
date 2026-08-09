@@ -3,8 +3,9 @@ Telegram Highlight Clip Bot
 ===========================
 
 A production-ready Telegram bot that:
-- Accepts uploaded videos or YouTube links.
+- Accepts uploaded videos, YouTube links, or Telegram post links.
 - Downloads YouTube videos via yt-dlp.
+- Downloads Telegram post media via a Telethon user account (2GB–4GB+ supported).
 - Detects scene changes with PySceneDetect.
 - Cuts highlight clips with FFmpeg (H.264 re-encode for reliability).
 - Sends every generated clip back to the requesting user.
@@ -12,7 +13,7 @@ A production-ready Telegram bot that:
 - Persists per-user profile / history / settings in SQLite.
 - Supports concurrent users with per-user cancellable jobs.
 
-Single-file design as required. Run with: python bot.py
+Single-file design as required. Run with: python paidbotfix2x.py
 """
 
 from __future__ import annotations
@@ -302,7 +303,7 @@ def is_owner(user_id: int) -> bool:
 
 def sanitize(name: str) -> str:
     """Return a filesystem-safe version of *name*."""
-    name = re.sub(r"[^\w-.() ]+", "_", name).strip()
+    name = re.sub(r"[^\w.()\- ]+", "_", name).strip()
     return name[:80] or "video"
 
 def fmt_bytes(n: int) -> str:
@@ -569,7 +570,7 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             job: Job, source_kind: str, source_ref) -> None:
     """
     Full pipeline:
-      1. Acquire source (Telegram file / YouTube URL)
+      1. Acquire source (Telegram file / YouTube URL / Telegram link)
       2. Scene-detect
       3. Cut clips
       4. Upload clips
@@ -771,7 +772,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Commands:</b>\n"
         "/start — greet\n"
         "/help — this message\n"
-        "/clip &lt;url&gt; — submit a YouTube link\n"
+        "/clip &lt;url&gt; — submit a YouTube or Telegram post link\n"
         "/status — current job status\n"
         "/settings — view/change your preferences\n"
         "/profile — your stats\n"
@@ -787,7 +788,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "<b>🎬 Highlight Clip Bot</b>\n"
-        "Python 3.12 · python-telegram-bot · yt-dlp · PySceneDetect · FFmpeg\n\n"
+        "Python · python-telegram-bot · Telethon · yt-dlp · PySceneDetect · FFmpeg\n\n"
         "Detects scene changes and produces MP4 highlight clips (H.264 + AAC).\n"
         f"Owners: <code>{', '.join(str(o) for o in sorted(OWNERS)) or 'not configured'}</code>"
     )
@@ -977,7 +978,7 @@ async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Message handlers (video uploads, YouTube URLs)
+# Message handlers (video uploads, YouTube URLs, Telegram links)
 # ---------------------------------------------------------------------------
 
 
