@@ -89,6 +89,10 @@ LOG_FILE = os.environ.get("LOG_FILE", "bot.log")
 DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
 STARTING_CREDITS = int(os.environ.get("STARTING_CREDITS", "3"))
 CREDITS_PER_JOB = int(os.environ.get("CREDITS_PER_JOB", "1"))
+# Lower preset / thread count = much less RAM per encode. "veryfast" is a
+# good default for small servers; override via .env if you have more RAM.
+FFMPEG_PRESET = os.environ.get("FFMPEG_PRESET", "veryfast").strip() or "veryfast"
+FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2").strip() or "2"
 
 # OWNER_ID accepts either a single ID or a comma-separated list (common typo
 # is putting multiple IDs here instead of OWNER_IDS) — both are parsed the
@@ -143,10 +147,32 @@ class Job:
     clips_created: int = 0
     is_owner: bool = False
     credit_charged: bool = False
+    # Needed so the sequential queue worker (below) can process this job
+    # long after _kick_off_job returned.
+    update: Optional[Update] = None
+    context: Optional[ContextTypes.DEFAULT_TYPE] = None
+    source_kind: str = ""
+    source_ref: object = None
 
 
 JOBS: dict[int, Job] = {}
 JOBS_LOCK = asyncio.Lock()
+
+# ---------------------------------------------------------------------------
+# Global sequential job queue
+# ---------------------------------------------------------------------------
+# Root cause of "ffmpeg exited with code -9": every job used to get its own
+# asyncio.create_task, so multiple users (or several links sent back-to-back)
+# could trigger several simultaneous libx264 re-encodes. Each encode is
+# memory-hungry; running more than one at once on a small server exhausts
+# RAM and the kernel OOM-killer sends SIGKILL (-9) to ffmpeg — which is why
+# there was never any stderr, the process was killed, not erroring on its
+# own. Routing every job through one worker that processes them strictly
+# one-at-a-time fixes this and matches "queue like one work is done then
+# another".
+JOB_QUEUE: list[Job] = []
+QUEUE_NOT_EMPTY = asyncio.Event()
+CURRENT_JOB: Optional[Job] = None
 
 
 # ---------------------------------------------------------------------------
@@ -543,22 +569,54 @@ async def detect_scenes(video_path: Path, threshold: float,
 
 
 async def cut_clip(source: Path, out_path: Path, start: float, end: float) -> None:
-    """Cut a clip using ffmpeg with H.264 re-encoding (reliable, precise cuts)."""
+    """Cut a clip using ffmpeg with H.264 re-encoding (reliable, precise cuts).
+
+    If the first attempt is killed by the OS (rc == -9 / SIGKILL — almost
+    always the kernel OOM-killer), automatically retries once with the
+    lightest possible encode profile (ultrafast, single thread) before
+    giving up on this clip. Combined with the single-worker queue above,
+    this should make the "-9, no stderr" failure effectively disappear.
+    """
     duration = max(0.1, end - start)
-    args = [
-        "-y", "-hide_banner", "-loglevel", "error",
-        "-ss", f"{start:.3f}",
-        "-i", str(source),
-        "-t", f"{duration:.3f}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-pix_fmt", "yuv420p",
-        str(out_path),
-    ]
-    rc, err = await run_ffmpeg(args)
+
+    def _args(preset: str, threads: str) -> list[str]:
+        return [
+            "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-c:v", "libx264", "-preset", preset, "-crf", "23",
+            "-threads", threads,
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            str(out_path),
+        ]
+
+    rc, err = await run_ffmpeg(_args(FFMPEG_PRESET, FFMPEG_THREADS))
+
+    if rc == -9:
+        log.warning(
+            "ffmpeg killed (SIGKILL) cutting %s — retrying with a lighter profile",
+            out_path.name,
+        )
+        try:
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        await asyncio.sleep(1.0)
+        rc, err = await run_ffmpeg(_args("ultrafast", "1"))
+
     if rc != 0:
-        detail = err.strip() or f"ffmpeg exited with code {rc} (no stderr output)"
+        if rc == -9:
+            detail = (
+                "ffmpeg was killed by the system (out of memory). "
+                "The server ran out of RAM mid-encode even on the lightest "
+                "profile — try a shorter clip length (/settings clip_length) "
+                "or a smaller/lower-resolution source video."
+            )
+        else:
+            detail = err.strip() or f"ffmpeg exited with code {rc} (no stderr output)"
         raise RuntimeError(f"ffmpeg cut failed: {detail[:400]}")
 
 
@@ -748,6 +806,92 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 # ---------------------------------------------------------------------------
+# Sequential queue worker
+# ---------------------------------------------------------------------------
+# Single long-lived task that pulls one job at a time off JOB_QUEUE and runs
+# it to completion before starting the next. This is what actually fixes the
+# "-9 / no stderr" crash: only one ffmpeg encode ever runs at once, so it
+# can't be starved of RAM by a sibling job, and jobs visibly go
+# queued -> running -> done one after another instead of racing each other.
+
+
+async def queue_worker() -> None:
+    global CURRENT_JOB
+    log.info("Queue worker started.")
+    while True:
+        await QUEUE_NOT_EMPTY.wait()
+
+        async with JOBS_LOCK:
+            job = JOB_QUEUE.pop(0) if JOB_QUEUE else None
+            if not JOB_QUEUE:
+                QUEUE_NOT_EMPTY.clear()
+
+        if job is None:
+            continue
+
+        if job.cancel_event.is_set():
+            # Was cancelled while still waiting in queue — _handle_cancel
+            # already did refund/history/cleanup for it.
+            continue
+
+        CURRENT_JOB = job
+        job.task = asyncio.current_task()
+        job.status = "starting"
+        try:
+            await process_video_job(job.update, job.context, job, job.source_kind, job.source_ref)
+        except asyncio.CancelledError:
+            log.info("job %s cancelled", job.job_id)
+        except Exception:
+            # process_video_job already reports failures to the user and
+            # cleans up in its own try/except/finally — this is a last-resort
+            # net so one bad job can never take the whole worker down and
+            # stall every job queued behind it.
+            log.exception("queue worker: job %s crashed unexpectedly", job.job_id)
+        finally:
+            CURRENT_JOB = None
+
+        # Renotify in case more jobs were queued while this one was running.
+        async with JOBS_LOCK:
+            if JOB_QUEUE:
+                QUEUE_NOT_EMPTY.set()
+
+
+async def _cancel_job(job: Job) -> None:
+    """Cancel a job whether it's still queued or already running."""
+    job.cancel_event.set()
+    async with JOBS_LOCK:
+        was_queued = job in JOB_QUEUE
+        if was_queued:
+            JOB_QUEUE.remove(job)
+
+    if was_queued:
+        # process_video_job never ran for this job, so replicate its
+        # finally-block bookkeeping (refund + history + JOBS cleanup) here.
+        if job.credit_charged and not job.is_owner:
+            try:
+                await db_add_credits(job.user_id, CREDITS_PER_JOB)
+            except Exception as e:
+                log.warning("credit refund failed for %s: %s", job.user_id, e)
+        try:
+            await db_add_history(
+                user_id=job.user_id,
+                source=job.source,
+                source_label=job.source_label,
+                clips_created=0,
+                status="cancelled",
+                duration_sec=time.time() - job.started_at,
+            )
+        except Exception as e:
+            log.warning("history write failed: %s", e)
+        async with JOBS_LOCK:
+            JOBS.pop(job.user_id, None)
+    elif job.task and not job.task.done():
+        # Already running — cancel the in-flight task; its own
+        # except/finally in process_video_job handles cleanup.
+        job.task.cancel()
+
+
+# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
@@ -815,11 +959,21 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("😴 No active job. Send a video or link to start.")
         return
     elapsed = time.time() - job.started_at
+    queue_line = ""
+    if job.status == "queued":
+        async with JOBS_LOCK:
+            try:
+                position = JOB_QUEUE.index(job) + 1
+            except ValueError:
+                position = 0
+        if position:
+            queue_line = f"Queue position: <b>{position}</b>\n"
     text = (
         f"<b>📊 Status</b>\n"
         f"Job: <code>{job.job_id}</code>\n"
         f"Source: {job.source} — {job.source_label}\n"
         f"State: <b>{job.status}</b>\n"
+        f"{queue_line}"
         f"Elapsed: {fmt_duration(elapsed)}\n"
         f"Clips sent: {job.clips_created}\n"
         f"{job.progress or ''}"
@@ -834,9 +988,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not job:
         await update.effective_message.reply_text("Nothing to cancel — no active job.")
         return
-    job.cancel_event.set()
-    if job.task and not job.task.done():
-        job.task.cancel()
+    await _cancel_job(job)
     await update.effective_message.reply_text("🛑 Cancelling your job…")
 
 
@@ -1066,29 +1218,33 @@ async def _kick_off_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
             source=source_kind,
             source_label=sanitize(label),
             is_owner=owner,
+            update=update,
+            context=context,
+            source_kind=source_kind,
+            source_ref=source_ref,
         )
         JOBS[u.id] = job
+        JOB_QUEUE.append(job)
+        position = len(JOB_QUEUE)
+        QUEUE_NOT_EMPTY.set()
 
     if not owner:
         # Reserve the credit now; refunded automatically if the job fails/cancels.
         await db_add_credits(u.id, -CREDITS_PER_JOB)
         job.credit_charged = True
 
+    queue_note = (
+        "you're up next" if position == 1
+        else f"position <b>{position}</b> in queue"
+    )
     msg = await update.effective_message.reply_html(
-        f"⏳ <b>Queued</b> — job <code>{job.job_id}</code>"
+        f"⏳ <b>Queued</b> — job <code>{job.job_id}</code> ({queue_note})\n"
+        "Jobs run one at a time so encoding never runs out of memory."
     )
     job.chat_id = msg.chat_id
     job.status_message_id = msg.message_id
-
-    async def _runner() -> None:
-        try:
-            await process_video_job(update, context, job, source_kind, source_ref)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception("runner crashed")
-
-    job.task = asyncio.create_task(_runner())
+    # job.task is set by queue_worker once this job actually starts running,
+    # so /cancel can still interrupt it mid-encode.
 
 
 # ---------------------------------------------------------------------------
@@ -1139,10 +1295,22 @@ async def _post_init(app: Application) -> None:
             )
     except Exception as e:
         log.error("Telethon connect failed: %s", e)
+
+    # One long-lived worker processes JOB_QUEUE strictly one job at a time —
+    # see queue_worker() for why (fixes the ffmpeg -9 / OOM crash).
+    app.bot_data["queue_worker_task"] = asyncio.create_task(queue_worker())
+
     log.info("Bot ready. Temp=%s  Output=%s", TEMP_FOLDER, OUTPUT_FOLDER)
 
 
 async def _post_shutdown(app: Application) -> None:
+    task = app.bot_data.get("queue_worker_task")
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     try:
         if tg_client.is_connected():
             await tg_client.disconnect()
@@ -1194,3 +1362,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+ 
