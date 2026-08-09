@@ -33,6 +33,17 @@ from pathlib import Path
 from typing import Optional
 
 import aiosqlite
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.types import PeerChannel
+from telethon.errors import (
+    ChannelPrivateError,
+    ChannelInvalidError,
+    UsernameNotOccupiedError,
+    UsernameInvalidError,
+    MessageIdInvalidError,
+    FloodWaitError,
+)
 from dotenv import load_dotenv
 from scenedetect import ContentDetector, SceneManager, open_video
 from telegram import Update
@@ -54,10 +65,21 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "").strip()
+TELEGRAM_SESSION = os.environ.get("TELEGRAM_SESSION", "").strip()
+
+# Telethon user-account client. Constructed here (no network yet); it is
+# connected inside _post_init() so it shares python-telegram-bot's event loop.
+tg_client = TelegramClient(
+    StringSession(TELEGRAM_SESSION),
+    API_ID,
+    API_HASH,
+)
 OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
 TEMP_FOLDER = Path(os.environ.get("TEMP_FOLDER", "temp")).resolve()
 OUTPUT_FOLDER = Path(os.environ.get("OUTPUT_FOLDER", "clips")).resolve()
-MAX_VIDEO_SIZE_MB = int(os.environ.get("MAX_VIDEO_SIZE_MB", "2048"))
+MAX_VIDEO_SIZE_MB = int(os.environ.get("MAX_VIDEO_SIZE_MB", "8192"))
 DEFAULT_CLIP_LENGTH = int(os.environ.get("DEFAULT_CLIP_LENGTH", "15"))
 SCENE_THRESHOLD = float(os.environ.get("SCENE_THRESHOLD", "22.0"))
 MAX_CLIPS_PER_JOB = int(os.environ.get("MAX_CLIPS_PER_JOB", "25"))
@@ -107,7 +129,7 @@ class Job:
 
     job_id: str
     user_id: int
-    source: str  # "telegram" or "youtube"
+    source: str  # "telegram", "youtube", or "telegram_link"
     source_label: str
     status: str = "queued"
     progress: str = ""
@@ -259,26 +281,29 @@ async def db_profile_stats(user_id: int) -> dict:
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
-
 YOUTUBE_RE = re.compile(
-    r"(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/|embed/|v/)|youtu\.be/)[\w\-]+",
+    r"(https?://)?(www\.)?(youtube\.com/(watch\?v=|shorts/|embed/|v/)|youtu\.be/)[\w-]+",
     re.IGNORECASE,
 )
 
+TG_RE = re.compile(
+    r"https://t\.me/(?:(c/\d+)|([A-Za-z0-9_]+))/(\d+)",
+    re.IGNORECASE,
+)
 
 def is_youtube_url(text: str) -> bool:
     return bool(YOUTUBE_RE.search(text or ""))
 
+def is_telegram_url(text: str) -> bool:
+    return bool(TG_RE.search(text or ""))
 
 def is_owner(user_id: int) -> bool:
     return user_id in OWNERS
 
-
 def sanitize(name: str) -> str:
     """Return a filesystem-safe version of *name*."""
-    name = re.sub(r"[^\w\-.() ]+", "_", name).strip()
+    name = re.sub(r"[^\w-.() ]+", "_", name).strip()
     return name[:80] or "video"
-
 
 def fmt_bytes(n: int) -> str:
     step = 1024.0
@@ -345,6 +370,99 @@ async def probe_duration(path: Path) -> float:
         return float(out.decode().strip())
     except (ValueError, FileNotFoundError):
         return 0.0
+
+
+async def download_telegram_link(link: str, workdir: Path, job: Job,
+                                 context: ContextTypes.DEFAULT_TYPE) -> Path:
+    """
+    Download the media of a Telegram post using the authenticated Telethon
+    *user* client (not the Bot API), so 2GB–4GB+ files are supported.
+
+    Handles:
+      • Public channels/groups:   https://t.me/<username>/<msg_id>
+      • Private channels/groups:  https://t.me/c/<internal_id>/<msg_id>
+
+    Raises ValueError with a friendly message for invalid links, missing
+    messages, messages without media, and inaccessible private chats.
+    """
+    if tg_client is None or not tg_client.is_connected():
+        raise RuntimeError("Telethon client is not connected — cannot download Telegram links.")
+
+    m = TG_RE.search(link or "")
+    if not m:
+        raise ValueError("That doesn't look like a valid Telegram post link.")
+
+    c_part, username, msg_id_raw = m.group(1), m.group(2), m.group(3)
+    msg_id = int(msg_id_raw)
+
+    async def _fetch_message():
+        if c_part:  # private chat form: c/<internal_id>
+            channel_id = int(c_part.split("/", 1)[1])
+            peer = PeerChannel(channel_id)
+        else:
+            peer = username
+        return await tg_client.get_messages(peer, ids=msg_id)
+
+    # ---- resolve + fetch the target message ----
+    try:
+        message = await _fetch_message()
+    except (ChannelPrivateError,):
+        raise ValueError(
+            "🔒 That chat is private and the logged-in account can't access it. "
+            "Make sure the account is a member of that channel/group."
+        )
+    except (UsernameNotOccupiedError, UsernameInvalidError):
+        raise ValueError("That channel/username doesn't exist.")
+    except (MessageIdInvalidError,):
+        raise ValueError("That message doesn't exist or was deleted.")
+    except (ValueError, ChannelInvalidError, TypeError):
+        # Common for private (c/...) links whose entity isn't cached yet:
+        # populate the dialog cache once, then retry.
+        try:
+            async for _ in tg_client.iter_dialogs():
+                pass
+            message = await _fetch_message()
+        except Exception:
+            raise ValueError(
+                "Couldn't access that chat. Make sure the logged-in account "
+                "is a member and the link is correct."
+            )
+    except FloodWaitError as e:
+        raise ValueError(f"Telegram rate limit hit — try again in {e.seconds}s.")
+
+    if message is None:
+        raise ValueError("That message doesn't exist or was deleted.")
+    if not getattr(message, "media", None):
+        raise ValueError("That Telegram message doesn't contain any downloadable media.")
+
+    # ---- throttled progress updates ----
+    last_update = 0.0
+
+    async def _progress(received: int, total: int) -> None:
+        nonlocal last_update
+        if job.cancel_event.is_set():
+            raise asyncio.CancelledError()
+        now = time.time()
+        if now - last_update < 2.0:
+            return
+        last_update = now
+        pct = (received / total * 100) if total else 0
+        await edit_status(
+            context, job,
+            f"📥 <b>Downloading Telegram media…</b>\n"
+            f"{fmt_bytes(received)} / {fmt_bytes(total) if total else '?'} ({pct:.1f}%)",
+        )
+
+    dest = workdir / "source"
+    out = await tg_client.download_media(
+        message, file=str(dest), progress_callback=_progress
+    )
+    if not out:
+        raise ValueError("Failed to download the media from that message.")
+    path = Path(out)
+    if not path.exists():
+        raise FileNotFoundError("Telegram download did not produce a file.")
+    return path
 
 
 async def download_youtube(url: str, workdir: Path, job: Job,
@@ -475,7 +593,12 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if source_kind == "youtube":
             await edit_status(context, job, "📥 <b>Fetching YouTube video…</b>")
             source_path = await download_youtube(source_ref, workdir, job, context)
-        else:  # telegram
+
+        elif source_kind == "telegram_link":
+            await edit_status(context, job, "📥 <b>Downloading from Telegram link…</b>")
+            source_path = await download_telegram_link(source_ref, workdir, job, context)
+
+        else:  # Telegram bot upload
             await edit_status(context, job, "📥 <b>Downloading your video…</b>")
             tg_file = await context.bot.get_file(source_ref)
             source_path = workdir / "source.mp4"
@@ -626,8 +749,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         credit_line = f"You have <b>{credits}</b> credit(s) (1 job = {CREDITS_PER_JOB} credit)."
     text = (
         f"👋 <b>Hello {u.first_name or 'there'}!</b>\n\n"
-        "I'm a <b>Highlight Clip Bot</b>. Send me a video or a YouTube link "
-        "and I'll auto-detect scene changes and cut highlight clips for you.\n\n"
+        "I'm a <b>Highlight Clip Bot</b>. Send me a video, a YouTube link, or a "
+        "Telegram post link and I'll auto-detect scene changes and cut highlight "
+        "clips for you.\n\n"
         f"{credit_line}\n\n"
         "Use /help to see what I can do."
     )
@@ -641,6 +765,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Send a video file (up to "
         f"{MAX_VIDEO_SIZE_MB} MB) — I'll process it automatically.\n"
         "• Or send a YouTube link and I'll download + process it.\n"
+        "• Or paste a Telegram post link (public/private channels, groups, "
+        "supergroups) — I'll fetch the media via a user account (2GB–4GB+ supported).\n"
         "• Use /clip &lt;url&gt; to explicitly submit a link.\n\n"
         "<b>Commands:</b>\n"
         "/start — greet\n"
@@ -834,15 +960,20 @@ async def cmd_addcredits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage: /clip <YouTube URL>\nOr just paste the URL directly."
+            "Usage: /clip <YouTube or Telegram post URL>\nOr just paste the URL directly."
         )
         return
     url = context.args[0]
-    if not is_youtube_url(url):
-        await update.effective_message.reply_text("❌ That doesn't look like a YouTube URL.")
-        return
-    await _kick_off_job(update, context, source_kind="youtube", source_ref=url,
-                       label=url)
+    if is_youtube_url(url):
+        await _kick_off_job(update, context, source_kind="youtube", source_ref=url,
+                           label=url)
+    elif is_telegram_url(url):
+        await _kick_off_job(update, context, source_kind="telegram_link", source_ref=url,
+                           label=url)
+    else:
+        await update.effective_message.reply_text(
+            "❌ That doesn't look like a YouTube or Telegram post URL."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -868,12 +999,29 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.effective_message.text or "").strip()
+
     if is_youtube_url(text):
-        await _kick_off_job(update, context, source_kind="youtube",
-                            source_ref=text, label=text)
+        await _kick_off_job(
+            update,
+            context,
+            source_kind="youtube",
+            source_ref=text,
+            label=text,
+        )
         return
+
+    if is_telegram_url(text):
+        await _kick_off_job(
+            update,
+            context,
+            source_kind="telegram_link",
+            source_ref=text,
+            label=text,
+        )
+        return
+
     await update.effective_message.reply_text(
-        "🤔 Send me a video, a YouTube link, or use /help to see commands."
+        "🤔 Send me a video, a YouTube link, or a Telegram post link, or use /help to see commands."
     )
 
 
@@ -962,7 +1110,32 @@ def check_binaries() -> None:
 
 async def _post_init(app: Application) -> None:
     await db_init()
+    # Connect the Telethon user client inside PTB's event loop so both share
+    # the same loop. The StringSession is already authenticated, so connect()
+    # is enough — no phone/code prompt.
+    try:
+        await tg_client.connect()
+        if await tg_client.is_user_authorized():
+            me = await tg_client.get_me()
+            uname = getattr(me, "username", None) or getattr(me, "id", "?")
+            log.info("Telethon client connected & authorized as @%s.", uname)
+        else:
+            log.error(
+                "Telethon session is NOT authorized. Telegram post links will "
+                "not work until a valid TELEGRAM_SESSION is provided."
+            )
+    except Exception as e:
+        log.error("Telethon connect failed: %s", e)
     log.info("Bot ready. Temp=%s  Output=%s", TEMP_FOLDER, OUTPUT_FOLDER)
+
+
+async def _post_shutdown(app: Application) -> None:
+    try:
+        if tg_client.is_connected():
+            await tg_client.disconnect()
+            log.info("Telethon client disconnected.")
+    except Exception as e:
+        log.debug("Telethon disconnect error: %s", e)
 
 
 def main() -> None:
@@ -975,6 +1148,7 @@ def main() -> None:
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .concurrent_updates(True)
         .build()
     )
