@@ -49,7 +49,7 @@ from dotenv import load_dotenv
 from scenedetect import ContentDetector, SceneManager, open_video
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -81,6 +81,13 @@ OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
 TEMP_FOLDER = Path(os.environ.get("TEMP_FOLDER", "temp")).resolve()
 OUTPUT_FOLDER = Path(os.environ.get("OUTPUT_FOLDER", "clips")).resolve()
 MAX_VIDEO_SIZE_MB = int(os.environ.get("MAX_VIDEO_SIZE_MB", "8192"))
+# Telegram's Bot API (getFile) refuses to serve files above 2000 MB (2 GB) —
+# this is a hard platform ceiling, true even on a self-hosted Local Bot API
+# Server, and no amount of raising MAX_VIDEO_SIZE_MB gets around it. Videos
+# sent as a YouTube link or a Telegram post link don't go through getFile
+# (they use yt-dlp / the Telethon user account instead) so those genuinely
+# support the full MAX_VIDEO_SIZE_MB (8 GB by default).
+TELEGRAM_BOT_API_FILE_LIMIT_MB = 2000
 DEFAULT_CLIP_LENGTH = int(os.environ.get("DEFAULT_CLIP_LENGTH", "15"))
 SCENE_THRESHOLD = float(os.environ.get("SCENE_THRESHOLD", "22.0"))
 MAX_CLIPS_PER_JOB = int(os.environ.get("MAX_CLIPS_PER_JOB", "25"))
@@ -303,6 +310,13 @@ async def db_profile_stats(user_id: int) -> dict:
         )
         row = await cur.fetchone()
         return dict(row) if row else {"jobs": 0, "clips": 0, "total_seconds": 0}
+
+
+async def db_get_all_user_ids() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users")
+        rows = await cur.fetchall()
+        return [int(r[0]) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +674,15 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         else:  # Telegram bot upload
             await edit_status(context, job, "📥 <b>Downloading your video…</b>")
-            tg_file = await context.bot.get_file(source_ref)
+            try:
+                tg_file = await context.bot.get_file(source_ref)
+            except BadRequest as e:
+                raise RuntimeError(
+                    "Telegram rejected this download — it's almost certainly over "
+                    "the platform's 2 GB bot-download limit. Forward the video to a "
+                    "channel/group I'm in and send the post link with /clip instead "
+                    f"(details: {e})"
+                )
             source_path = workdir / "source.mp4"
             await tg_file.download_to_drive(custom_path=str(source_path))
 
@@ -919,11 +941,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "<b>📖 Help</b>\n\n"
         "<b>How to use:</b>\n"
-        "• Send a video file (up to "
-        f"{MAX_VIDEO_SIZE_MB} MB) — I'll process it automatically.\n"
-        "• Or send a YouTube link and I'll download + process it.\n"
+        "• Send a video file directly (up to "
+        f"{TELEGRAM_BOT_API_FILE_LIMIT_MB} MB — Telegram's own bot-download limit) "
+        "— I'll process it automatically.\n"
+        "• Or send a YouTube link and I'll download + process it "
+        f"(up to {MAX_VIDEO_SIZE_MB} MB).\n"
         "• Or paste a Telegram post link (public/private channels, groups, "
-        "supergroups) — I'll fetch the media via a user account (2GB–4GB+ supported).\n"
+        f"supergroups) — I'll fetch the media via a user account "
+        f"(up to {MAX_VIDEO_SIZE_MB} MB — no 2 GB limit here).\n"
         "• Use /clip &lt;url&gt; to explicitly submit a link.\n\n"
         "<b>Commands:</b>\n"
         "/start — greet\n"
@@ -935,7 +960,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history — last 10 jobs\n"
         "/cancel — cancel the running job\n"
         "/about — about this bot\n"
-        f"/addcredits &lt;user_id&gt; &lt;amount&gt; — owner-only, grant/remove credits\n\n"
+        f"/addcredits &lt;user_id&gt; &lt;amount&gt; — owner-only, grant/remove credits\n"
+        "/endall — owner-only, cancel all jobs and notify every user of a restart\n\n"
         f"<b>Credits:</b> each job costs {CREDITS_PER_JOB}. Owners have unlimited credits."
     )
     await update.effective_message.reply_html(text)
@@ -1122,6 +1148,68 @@ async def cmd_addcredits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def cmd_endall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: cancel every active/queued job, then broadcast a
+    restart notice to every known user, one message at a time (queued)
+    so we never trip Telegram's flood limits."""
+    u = update.effective_user
+    if not is_owner(u.id):
+        await update.effective_message.reply_text("⛔ This command is owner-only.")
+        return
+
+    # ---------- 1. Stop all work in flight ----------
+    async with JOBS_LOCK:
+        all_jobs = list(JOBS.values())
+    for job in all_jobs:
+        try:
+            await _cancel_job(job)
+        except Exception as e:
+            log.warning("endall: failed to cancel job %s: %s", job.job_id, e)
+    cancelled_count = len(all_jobs)
+
+    # ---------- 2. Queue the broadcast ----------
+    broadcast_text = (
+        "🔄 <b>The bot owner has restarted the bot.</b>\n"
+        "Your work has ended — please try again in a little while."
+    )
+    user_ids = await db_get_all_user_ids()
+
+    await update.effective_message.reply_html(
+        f"🛑 Cancelled <b>{cancelled_count}</b> active/queued job(s).\n"
+        f"📣 Queuing restart notice to <b>{len(user_ids)}</b> user(s)…"
+    )
+
+    sent, blocked, failed = 0, 0, 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(uid, broadcast_text, parse_mode=ParseMode.HTML)
+            sent += 1
+        except Forbidden:
+            # User blocked the bot / deleted their account — not an error.
+            blocked += 1
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+            try:
+                await context.bot.send_message(uid, broadcast_text, parse_mode=ParseMode.HTML)
+                sent += 1
+            except TelegramError as e2:
+                log.warning("endall: broadcast to %s failed after retry: %s", uid, e2)
+                failed += 1
+        except TelegramError as e:
+            log.warning("endall: broadcast to %s failed: %s", uid, e)
+            failed += 1
+        # Small delay between sends keeps us well under Telegram's ~30
+        # msgs/sec global rate limit even for large user lists.
+        await asyncio.sleep(0.05)
+
+    await update.effective_message.reply_html(
+        f"✅ <b>Broadcast complete.</b>\n"
+        f"Sent: <b>{sent}</b> · Blocked/unreachable: <b>{blocked}</b> · Failed: <b>{failed}</b>\n"
+        f"Jobs cancelled: <b>{cancelled_count}</b>\n\n"
+        "The bot is now idle — safe to restart the process."
+    )
+
+
 async def cmd_clip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.effective_message.reply_text(
@@ -1151,9 +1239,22 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     video = msg.video or msg.document
     if not video:
         return
-    if getattr(video, "file_size", None) and video.file_size > MAX_VIDEO_SIZE_MB * 1024 * 1024:
+    file_size = getattr(video, "file_size", None)
+    if file_size and file_size > TELEGRAM_BOT_API_FILE_LIMIT_MB * 1024 * 1024:
+        await msg.reply_html(
+            f"❌ <b>That file is {fmt_bytes(file_size)}.</b>\n"
+            f"Telegram itself caps direct bot downloads at "
+            f"{TELEGRAM_BOT_API_FILE_LIMIT_MB} MB (2 GB) — no bot can get around "
+            f"this, it's a platform limit, not something I control.\n\n"
+            f"For files up to {MAX_VIDEO_SIZE_MB} MB, forward this video to a "
+            f"channel/group I'm a member of, then send me the post link "
+            f"(<code>/clip https://t.me/...</code>) — that path supports much "
+            f"bigger files."
+        )
+        return
+    if file_size and file_size > MAX_VIDEO_SIZE_MB * 1024 * 1024:
         await msg.reply_text(
-            f"❌ File too large ({fmt_bytes(video.file_size)}). "
+            f"❌ File too large ({fmt_bytes(file_size)}). "
             f"Max allowed: {MAX_VIDEO_SIZE_MB} MB."
         )
         return
@@ -1345,6 +1446,7 @@ def main() -> None:
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("addcredits", cmd_addcredits))
+    app.add_handler(CommandHandler("endall", cmd_endall))
 
     # Media & text
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, on_video))
@@ -1362,4 +1464,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
- 
