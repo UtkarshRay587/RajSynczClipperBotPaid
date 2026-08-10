@@ -63,7 +63,14 @@ from telegram.ext import (
 # Configuration & logging
 # ---------------------------------------------------------------------------
 
-load_dotenv()
+# override=True: if MAX_VIDEO_SIZE_MB (or any other var) is ALSO set outside
+# this .env file — systemd Environment=, docker-compose `environment:`, an
+# exported shell var, a process manager's env config — python-dotenv's
+# default behaviour is to silently keep that outside value and ignore the
+# .env file. That silent precedence is exactly the kind of thing that makes
+# "I changed .env but the old limit is still there" happen. override=True
+# makes .env authoritative every time, so editing it always takes effect.
+load_dotenv(override=True)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -972,7 +979,9 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>🎬 Highlight Clip Bot</b>\n"
         "Python · python-telegram-bot · Telethon · yt-dlp · PySceneDetect · FFmpeg\n\n"
         "Detects scene changes and produces MP4 highlight clips (H.264 + AAC).\n"
-        f"Owners: <code>{', '.join(str(o) for o in sorted(OWNERS)) or 'not configured'}</code>"
+        f"Owners: <code>{', '.join(str(o) for o in sorted(OWNERS)) or 'not configured'}</code>\n"
+        f"Max video size (YouTube/link): <code>{MAX_VIDEO_SIZE_MB} MB</code>\n"
+        f"Max direct upload (Telegram limit): <code>{TELEGRAM_BOT_API_FILE_LIMIT_MB} MB</code>"
     )
     await update.effective_message.reply_html(text)
 
@@ -1402,6 +1411,12 @@ async def _post_init(app: Application) -> None:
     app.bot_data["queue_worker_task"] = asyncio.create_task(queue_worker())
 
     log.info("Bot ready. Temp=%s  Output=%s", TEMP_FOLDER, OUTPUT_FOLDER)
+    log.info(
+        "Effective config: MAX_VIDEO_SIZE_MB=%s  TELEGRAM_BOT_API_FILE_LIMIT_MB=%s "
+        " FFMPEG_PRESET=%s  FFMPEG_THREADS=%s  DB_PATH=%s",
+        MAX_VIDEO_SIZE_MB, TELEGRAM_BOT_API_FILE_LIMIT_MB,
+        FFMPEG_PRESET, FFMPEG_THREADS, DB_PATH,
+    )
 
 
 async def _post_shutdown(app: Application) -> None:
