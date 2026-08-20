@@ -107,6 +107,16 @@ CREDITS_PER_JOB = int(os.environ.get("CREDITS_PER_JOB", "1"))
 # good default for small servers; override via .env if you have more RAM.
 FFMPEG_PRESET = os.environ.get("FFMPEG_PRESET", "veryfast").strip() or "veryfast"
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2").strip() or "2"
+# How many jobs are allowed to run at the same time. Each concurrent job can
+# run its own libx264 encode, and each encode is memory-hungry — that's what
+# caused the old "ffmpeg exited with code -9" (kernel OOM-killer) crashes
+# when everything ran in parallel with no cap. Raising this above 1 trades
+# some of that safety margin back for throughput, so pair a higher value
+# here with a lower FFMPEG_THREADS (and/or a lighter FFMPEG_PRESET like
+# "ultrafast") if you see -9 crashes come back. Start low, watch RAM usage
+# (e.g. `free -m` while jobs run), and raise it only as far as your server
+# can actually support.
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MAX_CONCURRENT_JOBS", "2")))
  
 # OWNER_ID accepts either a single ID or a comma-separated list (common typo
 # is putting multiple IDs here instead of OWNER_IDS) — both are parsed the
@@ -173,20 +183,15 @@ JOBS: dict[int, Job] = {}
 JOBS_LOCK = asyncio.Lock()
  
 # ---------------------------------------------------------------------------
-# Global sequential job queue
+# Global job queue with bounded concurrency
 # ---------------------------------------------------------------------------
-# Root cause of "ffmpeg exited with code -9": every job used to get its own
-# asyncio.create_task, so multiple users (or several links sent back-to-back)
-# could trigger several simultaneous libx264 re-encodes. Each encode is
-# memory-hungry; running more than one at once on a small server exhausts
-# RAM and the kernel OOM-killer sends SIGKILL (-9) to ffmpeg — which is why
-# there was never any stderr, the process was killed, not erroring on its
-# own. Routing every job through one worker that processes them strictly
-# one-at-a-time fixes this and matches "queue like one work is done then
-# another".
+# A pool of MAX_CONCURRENT_JOBS worker loops pulls jobs off JOB_QUEUE, so up
+# to that many jobs run at once instead of strictly one-at-a-time. Each
+# worker still runs a job in its own child task (see queue_worker below), so
+# /cancel on one job never affects any other job or worker.
 JOB_QUEUE: list[Job] = []
 QUEUE_NOT_EMPTY = asyncio.Event()
-CURRENT_JOB: Optional[Job] = None
+CURRENT_JOBS: set[Job] = set()
  
  
 # ---------------------------------------------------------------------------
@@ -595,8 +600,7 @@ async def cut_clip(source: Path, out_path: Path, start: float, end: float) -> No
     If the first attempt is killed by the OS (rc == -9 / SIGKILL — almost
     always the kernel OOM-killer), automatically retries once with the
     lightest possible encode profile (ultrafast, single thread) before
-    giving up on this clip. Combined with the single-worker queue above,
-    this should make the "-9, no stderr" failure effectively disappear.
+    giving up on this clip.
     """
     duration = max(0.1, end - start)
  
@@ -633,8 +637,9 @@ async def cut_clip(source: Path, out_path: Path, start: float, end: float) -> No
             detail = (
                 "ffmpeg was killed by the system (out of memory). "
                 "The server ran out of RAM mid-encode even on the lightest "
-                "profile — try a shorter clip length (/settings clip_length) "
-                "or a smaller/lower-resolution source video."
+                "profile — try a shorter clip length (/settings clip_length), "
+                "a smaller/lower-resolution source video, or lower "
+                "MAX_CONCURRENT_JOBS so fewer encodes run at once."
             )
         else:
             detail = err.strip() or f"ffmpeg exited with code {rc} (no stderr output)"
@@ -722,13 +727,7 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
             raise RuntimeError("No usable scenes were detected in this video.")
  
         # Cap to max_clips by sampling EVENLY across the whole scene list,
-        # not by simply taking the first max_clips in timeline order. The
-        # old `scenes[:max_clips]` always grabbed only the earliest part of
-        # the video — for a long match replay that's usually just the
-        # opening overs, so every job kept producing near-identical early
-        # "batting" clips and never reached the rest of the match. Even
-        # sampling spreads the selected clips across the entire replay so
-        # highlights from later in the video get included too.
+        # not by simply taking the first max_clips in timeline order.
         if len(scenes) > max_clips:
             step = len(scenes) / max_clips
             scenes = [scenes[int(i * step)] for i in range(max_clips)]
@@ -756,9 +755,6 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 log.warning("clip %d failed: %s", idx, e)
  
         if not cut_paths:
-            # Surface the actual ffmpeg error instead of a generic message so
-            # the user knows *why* (unreadable/corrupt source, unsupported codec,
-            # a split-archive part like .part003.mkv, missing ffmpeg, etc.).
             if last_cut_error:
                 raise RuntimeError(f"All clips failed to encode. {last_cut_error}")
             raise RuntimeError(
@@ -847,18 +843,17 @@ async def process_video_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
  
  
 # ---------------------------------------------------------------------------
-# Sequential queue worker
+# Queue workers (bounded concurrency)
 # ---------------------------------------------------------------------------
-# Single long-lived task that pulls one job at a time off JOB_QUEUE and runs
-# it to completion before starting the next. This is what actually fixes the
-# "-9 / no stderr" crash: only one ffmpeg encode ever runs at once, so it
-# can't be starved of RAM by a sibling job, and jobs visibly go
-# queued -> running -> done one after another instead of racing each other.
+# MAX_CONCURRENT_JOBS copies of this coroutine run at once, each pulling one
+# job at a time off JOB_QUEUE. That means up to MAX_CONCURRENT_JOBS jobs are
+# in flight simultaneously, each still processed start-to-finish inside its
+# own child task (job_task below) so /cancel on one job never touches the
+# worker loop itself or any other job.
  
  
-async def queue_worker() -> None:
-    global CURRENT_JOB
-    log.info("Queue worker started.")
+async def queue_worker(worker_id: int) -> None:
+    log.info("Queue worker #%d started.", worker_id)
     while True:
         await QUEUE_NOT_EMPTY.wait()
  
@@ -875,20 +870,15 @@ async def queue_worker() -> None:
             # already did refund/history/cleanup for it.
             continue
  
-        CURRENT_JOB = job
+        CURRENT_JOBS.add(job)
         job.status = "starting"
-        # IMPORTANT: run the job in its OWN task, not the queue_worker's own
-        # task. The old code did `job.task = asyncio.current_task()`, which
-        # pointed at this *while-loop's* task. Cancelling that job's task
-        # (from /cancel or /endall) therefore cancelled the entire
-        # queue_worker loop, not just that one job — after which no future
-        # job was ever processed again until the process was restarted by
-        # hand. That's exactly the "works for a few days, then /endall
-        # breaks it" symptom: the first time someone cancelled a job that
-        # was actively running, the worker died silently and every job
-        # after that just sat in the queue forever. Giving each job its own
-        # child task means job.task.cancel() only cancels that child; this
-        # while loop (and QUEUE_NOT_EMPTY.wait()) keeps running forever.
+        # IMPORTANT: run the job in its OWN task, not this worker loop's own
+        # task. Pointing job.task at the worker's own task would mean
+        # cancelling that job (from /cancel or /endall) cancels the whole
+        # worker loop, not just that one job — after which no future job
+        # picked up by this worker would ever run again. Giving each job its
+        # own child task means job.task.cancel() only cancels that child;
+        # this while loop (and QUEUE_NOT_EMPTY.wait()) keeps running forever.
         job_task = asyncio.create_task(
             process_video_job(job.update, job.context, job, job.source_kind, job.source_ref)
         )
@@ -900,11 +890,11 @@ async def queue_worker() -> None:
         except Exception:
             # process_video_job already reports failures to the user and
             # cleans up in its own try/except/finally — this is a last-resort
-            # net so one bad job can never take the whole worker down and
-            # stall every job queued behind it.
-            log.exception("queue worker: job %s crashed unexpectedly", job.job_id)
+            # net so one bad job can never take this worker down and stall
+            # every job it would have picked up after.
+            log.exception("queue worker #%d: job %s crashed unexpectedly", worker_id, job.job_id)
         finally:
-            CURRENT_JOB = None
+            CURRENT_JOBS.discard(job)
  
         # Renotify in case more jobs were queued while this one was running.
         async with JOBS_LOCK:
@@ -1008,7 +998,8 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Detects scene changes and produces MP4 highlight clips (H.264 + AAC).\n"
         f"Owners: <code>{', '.join(str(o) for o in sorted(OWNERS)) or 'not configured'}</code>\n"
         f"Max video size (YouTube/link): <code>{MAX_VIDEO_SIZE_MB} MB</code>\n"
-        f"Max direct upload (Telegram limit): <code>{TELEGRAM_BOT_API_FILE_LIMIT_MB} MB</code>"
+        f"Max direct upload (Telegram limit): <code>{TELEGRAM_BOT_API_FILE_LIMIT_MB} MB</code>\n"
+        f"Max concurrent jobs: <code>{MAX_CONCURRENT_JOBS}</code>"
     )
     await update.effective_message.reply_html(text)
  
@@ -1363,6 +1354,7 @@ async def _kick_off_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
         JOBS[u.id] = job
         JOB_QUEUE.append(job)
         position = len(JOB_QUEUE)
+        idle_workers = MAX_CONCURRENT_JOBS - len(CURRENT_JOBS)
         QUEUE_NOT_EMPTY.set()
  
     if not owner:
@@ -1370,13 +1362,13 @@ async def _kick_off_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await db_add_credits(u.id, -CREDITS_PER_JOB)
         job.credit_charged = True
  
-    queue_note = (
-        "you're up next" if position == 1
-        else f"position <b>{position}</b> in queue"
-    )
+    if idle_workers > 0:
+        queue_note = "starting shortly"
+    else:
+        queue_note = f"position <b>{position}</b> in queue"
     msg = await update.effective_message.reply_html(
         f"⏳ <b>Queued</b> — job <code>{job.job_id}</code> ({queue_note})\n"
-        "Jobs run one at a time so encoding never runs out of memory."
+        f"Up to {MAX_CONCURRENT_JOBS} job(s) run at the same time."
     )
     job.chat_id = msg.chat_id
     job.status_message_id = msg.message_id
@@ -1433,23 +1425,27 @@ async def _post_init(app: Application) -> None:
     except Exception as e:
         log.error("Telethon connect failed: %s", e)
  
-    # One long-lived worker processes JOB_QUEUE strictly one job at a time —
-    # see queue_worker() for why (fixes the ffmpeg -9 / OOM crash).
-    app.bot_data["queue_worker_task"] = asyncio.create_task(queue_worker())
+    # A pool of MAX_CONCURRENT_JOBS long-lived workers processes JOB_QUEUE —
+    # see queue_worker() for the concurrency/OOM trade-off this controls.
+    app.bot_data["queue_worker_tasks"] = [
+        asyncio.create_task(queue_worker(i + 1)) for i in range(MAX_CONCURRENT_JOBS)
+    ]
  
     log.info("Bot ready. Temp=%s  Output=%s", TEMP_FOLDER, OUTPUT_FOLDER)
     log.info(
         "Effective config: MAX_VIDEO_SIZE_MB=%s  TELEGRAM_BOT_API_FILE_LIMIT_MB=%s "
-        " FFMPEG_PRESET=%s  FFMPEG_THREADS=%s  DB_PATH=%s",
+        " FFMPEG_PRESET=%s  FFMPEG_THREADS=%s  MAX_CONCURRENT_JOBS=%s  DB_PATH=%s",
         MAX_VIDEO_SIZE_MB, TELEGRAM_BOT_API_FILE_LIMIT_MB,
-        FFMPEG_PRESET, FFMPEG_THREADS, DB_PATH,
+        FFMPEG_PRESET, FFMPEG_THREADS, MAX_CONCURRENT_JOBS, DB_PATH,
     )
  
  
 async def _post_shutdown(app: Application) -> None:
-    task = app.bot_data.get("queue_worker_task")
-    if task and not task.done():
-        task.cancel()
+    tasks = app.bot_data.get("queue_worker_tasks") or []
+    for task in tasks:
+        if task and not task.done():
+            task.cancel()
+    for task in tasks:
         try:
             await task
         except asyncio.CancelledError:
@@ -1506,4 +1502,3 @@ def main() -> None:
  
 if __name__ == "__main__":
     main()
- 
